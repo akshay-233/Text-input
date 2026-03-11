@@ -1,0 +1,1027 @@
+
+#!/usr/bin/env python3
+"""
+Flask Server for Multi-Tool Audio Processing
+Direct Azure OpenAI Realtime API integration
+Provides REST API for voice input/output streaming with zero-latency audio chunk transmission
+
+BENEFITS:
+- No WebM codec overhead
+- Direct PCM-16 format (model's expected input)
+- Lower latency (no format conversion server-side)
+- Efficient bandwidth usage
+- Real-time audio streaming from both directions
+"""
+
+import asyncio
+import os
+import json
+import io
+import time
+import traceback
+import logging
+from typing import Optional, Tuple, Dict, Any
+from collections import deque
+from dataclasses import dataclass
+from flask import Flask, render_template, request, send_file, jsonify
+from flask_cors import CORS
+from flask_sock import Sock
+from dotenv import load_dotenv
+from pathlib import Path
+import base64
+from werkzeug.utils import secure_filename
+import httpx  # For async tool calls
+
+# Azure OpenAI Realtime SDK
+from openai import AzureOpenAI
+
+# ==============================
+# MINIMAL SESSION TRACKING
+# ==============================
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / f"session_{int(time.time())}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[logging.FileHandler(LOG_FILE)]
+)
+logger = logging.getLogger(__name__)
+
+class SessionMetrics:
+    """Track and log only essential session metrics"""
+    def __init__(self):
+        self.session_id = int(time.time())
+        self.start_time = time.time()
+        self.input_chunks = 0
+        self.output_chunks = 0
+        self.tools_called = []
+        self.ui_messages_sent = 0
+        self.tool_results = []
+    
+    def log(self, msg):
+        """Log a message with timestamp"""
+        elapsed = time.time() - self.start_time
+        log_msg = f"[{elapsed:.2f}s] {msg}"
+        logger.info(log_msg)
+    
+    def print_summary(self):
+        """Print final session summary"""
+        total_time = time.time() - self.start_time
+        summary = f"""
+{'='*70}
+SESSION SUMMARY
+{'='*70}
+📊 Input audio chunks:     {self.input_chunks}
+📊 Output audio chunks:    {self.output_chunks}
+📊 UI messages sent:       {self.ui_messages_sent}
+🔧 Tools called:          {len(self.tools_called)}
+⏱️  Total execution time:   {total_time:.2f}s
+{'='*70}
+"""
+        if self.tools_called:
+            summary += "Tools executed:\n"
+            for i, tool in enumerate(self.tools_called, 1):
+                summary += f"  {i}. {tool['name']}({tool['args']})\n"
+        summary += f"\n🔵 Session ID: {self.session_id}\n"
+        logger.info(summary)
+
+session_metrics = SessionMetrics()
+
+class LatencyTracker:
+    """Minimal latency tracking"""
+    def __init__(self):
+        self.start_time = time.time()
+    
+    def mark(self, event_name: str):
+        pass  # Simplified version
+    
+    def print_report(self):
+        session_metrics.print_summary()
+
+# ==============================
+# REALTIME CLIENT (Azure SDK-based Connection)
+# ==============================
+class BaseRealtimeClient:
+    """
+    Persistent client for real-time bidirectional streaming using official Azure SDK.
+    
+    Wraps the Azure OpenAI SDK's RealtimeConnection (which is synchronous) 
+    for use in an async/Flask environment via executor threads.
+    
+    The SDK handles:
+    - WebSocket connection management (no manual WSS needed)
+    - Event serialization/deserialization
+    - Full session lifecycle management
+    """
+    
+    def __init__(self, api_key: str, azure_endpoint: str, deployment: str):
+        """
+        Initialize the Realtime client.
+        
+        Args:
+            api_key: Azure OpenAI API key
+            azure_endpoint: Azure OpenAI endpoint (base URL without /realtime)
+            deployment: Azure deployment name (e.g., gpt-4o-realtime-preview)
+        """
+        self.api_key = api_key
+        self.azure_endpoint = azure_endpoint
+        self.deployment = deployment
+        self.sdk_client = None
+        self.realtime_conn = None  # SDK's RealtimeConnection (sync)
+        self.latency = LatencyTracker()
+        self.conversation_id = None
+        self.input_audio_buffer = deque()
+        self.is_sending_audio = False
+    
+    async def connect(self) -> None:
+        """Establish Azure Realtime connection using official SDK"""
+        
+        try:
+            # Initialize Azure OpenAI SDK client with base endpoint
+            # The SDK handles all WebSocket and authentication internally
+            self.sdk_client = AzureOpenAI(
+                api_key=self.api_key,
+                api_version="2024-10-01-preview",
+                azure_endpoint=self.azure_endpoint
+            )
+            
+            # Create realtime connection using SDK
+            # SDK's connect() is synchronous, run it in executor to avoid blocking
+            def establish_connection():
+                """Establish connection in executor thread (SDK is synchronous)"""
+                try:
+                    # SDK's connect() handles:
+                    # - WebSocket negotiation
+                    # - Authentication headers
+                    # - Session creation
+                    # Returns a context manager -> we enter it to get the actual connection
+                    connection_manager = self.sdk_client.beta.realtime.connect(model=self.deployment)
+                    
+                    # Explicitly enter the context manager to get the active connection
+                    realtime_conn = connection_manager.__enter__()
+                    return realtime_conn
+                except Exception as e:
+                    logger.error(f"SDK connection failed: {e}")
+                    raise
+            
+            # Run sync SDK method in executor thread
+            self.realtime_conn = await asyncio.get_event_loop().run_in_executor(
+                None, 
+                establish_connection
+            )
+            
+            # Configure session after connection
+            await self._configure_session()
+            
+        except Exception as e:
+            logger.error(f"Failed to connect: {e}")
+            raise
+    
+    async def _send_message(self, message: dict) -> None:
+        """Send a message via SDK connection in executor thread"""
+        try:
+            def send_sync():
+                """Send message - SDK method is synchronous"""
+                self.realtime_conn.send(message)
+            
+            await asyncio.get_event_loop().run_in_executor(None, send_sync)
+        except Exception as e:
+            logger.error(f"Error sending message to Azure: {e}")
+            raise
+    
+    async def _configure_session(self) -> None:
+        """Configure realtime session with modalities, tools, and instructions"""
+        try:
+            session_config = {
+                "type": "session.update",
+                "session": {
+                    "modalities": ["text", "audio"],
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": "pcm16",
+                    "input_audio_transcription": {
+                        "model": "whisper-1"
+                    },
+                    "instructions": (
+                        "You are a helpful assistant. "
+                        "Answer ONLY the most recent user question. "
+                        "If a new question arrives, treat it as a new conversational turn with fresh context. "
+                        "Do not repeat or reference previous answers unless explicitly asked. "
+                        "Use available tools to help answer user questions. "
+                        "After receiving tool result, respond briefly and speak the answer."
+                    ),
+                    "tool_choice": "auto",
+                    "tools": get_tools_schema(),  # Dynamic tool registry
+                    "voice": "echo",
+                    "temperature": 0.7,
+                    "max_response_output_tokens": 4096
+                }
+            }
+            
+            await self._send_message(session_config)
+            session_metrics.log("🔧 Session configured with tools")
+        except Exception as e:
+            logger.error(f"Failed to configure session: {e}")
+            raise
+    
+    async def send_audio_chunk(self, audio_base64: str, chunk_index: int = 0) -> None:
+        """Send audio chunk to Azure via SDK"""
+        message = {
+            "type": "input_audio_buffer.append",
+            "audio": audio_base64
+        }
+        
+        await self._send_message(message)
+    
+    async def commit_audio_buffer(self) -> None:
+        """Commit audio buffer - signals end of audio input"""
+        message = {
+            "type": "input_audio_buffer.commit"
+        }
+        
+        await self._send_message(message)
+    
+    async def send_text_input(self, text: str) -> None:
+        """Send text input to Azure for processing"""
+        message = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": text
+                    }
+                ]
+            }
+        }
+        
+        await self._send_message(message)
+    
+    async def request_response(self, modalities: list = None) -> None:
+        """Request response generation from Azure"""
+        message = {
+            "type": "response.create"
+        }
+        
+        await self._send_message(message)
+    
+    async def interrupt_response(self) -> None:
+        """Cancel current response generation"""
+        message = {
+            "type": "response.cancel"
+        }
+        await self._send_message(message)
+    
+    async def recv_event(self) -> dict:
+        """
+        Receive next event from Azure SDK.
+        
+        SDK returns RealtimeServerEvent objects (Pydantic v2 models).
+        This method converts them to JSON-compatible dicts for frontend compatibility.
+        """
+        def recv_sync():
+            """Receive event - SDK method is synchronous"""
+            event = self.realtime_conn.recv()
+            
+            # Convert SDK event object to dict using Pydantic v2 model_dump
+            try:
+                if hasattr(event, 'model_dump'):
+                    # Pydantic v2 - proper way to serialize models
+                    return event.model_dump(by_alias=True, exclude_none=False)
+                elif hasattr(event, 'dict'):
+                    # Fallback for Pydantic v1
+                    return event.dict()
+                else:
+                    # Last resort - JSON serialization with str fallback
+                    return json.loads(json.dumps(event, default=str))
+            except Exception as e:
+                logger.error(f"Error converting SDK event to dict: {e}. Event type: {type(event)}")
+                # Return error event
+                return {"type": "error", "error": str(e)}
+        
+        # Run sync receive in executor to avoid blocking event loop
+        return await asyncio.get_event_loop().run_in_executor(None, recv_sync)
+    
+    async def close(self) -> None:
+        """Close connection and cleanup"""
+        def close_sync():
+            """Close connection - SDK method is synchronous"""
+            if self.realtime_conn:
+                try:
+                    self.realtime_conn.close()
+                except Exception as e:
+                    logger.warning(f"Error closing connection: {e}")
+        
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, close_sync)
+        except Exception as e:
+            logger.error(f"Error in close: {e}")
+
+# ==============================
+# TOOL DEFINITIONS
+# ==============================
+async def get_weather_async(location: str):
+    """Get weather for a location"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            geo_response = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": location, "count": 1}
+            )
+            geo = geo_response.json()
+            
+            if "results" not in geo or not geo["results"]:
+                return {"ok": False, "error": f"Location not found: {location}"}
+            
+            lat = geo["results"][0]["latitude"]
+            lon = geo["results"][0]["longitude"]
+            resolved = geo["results"][0]["name"]
+            country = geo["results"][0].get("country", "")
+            
+            weather_response = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={"latitude": lat, "longitude": lon, "current_weather": True}
+            )
+            weather = weather_response.json()
+            cw = weather.get("current_weather")
+            
+            return {
+                "ok": True,
+                "location": f"{resolved}, {country}",
+                "latitude": lat,
+                "longitude": lon,
+                "current_weather": cw
+            }
+    except Exception as e:
+        return {"ok": False, "error": f"Weather API error: {str(e)}"}
+
+async def calculate_async(expression: str):
+    """Calculator tool"""
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: eval(expression))
+        return {"ok": True, "expression": expression, "result": result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+TOOLS_REGISTRY = {
+    "get_weather": {
+        "function": get_weather_async,
+        "description": "Get current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"}
+            },
+            "required": ["location"]
+        }
+    },
+    "calculate": {
+        "function": calculate_async,
+        "description": "Perform mathematical calculations",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string"}
+            },
+            "required": ["expression"]
+        }
+    }
+}
+
+def get_tools_schema():
+    """Get tool definitions for LLM"""
+    return [
+        {
+            "type": "function",
+            "name": name,
+            "description": config["description"],
+            "parameters": config["parameters"]
+        }
+        for name, config in TOOLS_REGISTRY.items()
+    ]
+
+async def execute_tool_async(tool_name: str, args: dict):
+    """Execute a tool asynchronously"""
+    if tool_name not in TOOLS_REGISTRY:
+        return {"ok": False, "error": f"Tool '{tool_name}' not found"}
+    
+    tool_func = TOOLS_REGISTRY[tool_name]["function"]
+    try:
+        return await tool_func(**args)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ==============================
+# EXTENDED REALTIME CLIENT
+# ==============================
+class RealtimeClient(BaseRealtimeClient):
+    """Extended RealtimeClient with tool execution support"""
+    
+    async def _execute_tool_async_impl(self, tool_name: str, args: dict):
+        """Execute tool asynchronously with debugging"""
+        result = await execute_tool_async(tool_name, args)
+        return result
+
+# ==============================
+# DEBUG LOGGING
+# ==============================
+
+
+# ==============================
+# FLASK APP SETUP
+# ==============================
+app = Flask(__name__)
+CORS(app)
+sock = Sock(app)
+
+# Configuration
+load_dotenv(".env")
+API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+
+CHUNK_SIZE = 4096  # For streaming
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+
+# Global client (connection pooling)
+global_client = None
+
+# ==============================
+# ROUTES
+# ==============================
+
+@app.route('/')
+def index():
+    """Serve the main UI"""
+    return render_template('multi_tool_audio_ui.html')
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'ok',
+        'api_configured': bool(API_KEY and AZURE_ENDPOINT),
+        'streaming_enabled': True
+    }), 200
+
+@app.route('/api/logs', methods=['GET'])
+def get_logs():
+    """Get the latest session log file"""
+    try:
+        # Find the latest log file
+        log_files = sorted(LOG_DIR.glob("session_*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if not log_files:
+            return jsonify({"error": "No logs found"}), 404
+        
+        latest_log = log_files[0]
+        
+        with open(latest_log, 'r') as f:
+            log_content = f.read()
+        
+        return jsonify({
+            "filename": latest_log.name,
+            "content": log_content,
+            "size_bytes": latest_log.stat().st_size
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/logs/download', methods=['GET'])
+def download_logs():
+    """Download the latest log file"""
+    try:
+        log_files = sorted(LOG_DIR.glob("session_*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if not log_files:
+            return "No logs found", 404
+        
+        latest_log = log_files[0]
+        return send_file(
+            latest_log,
+            as_attachment=True,
+            download_name=latest_log.name,
+            mimetype='text/plain'
+        )
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
+@app.route('/api/logs/frontend', methods=['POST'])
+def save_frontend_logs():
+    """Save frontend console logs"""
+    try:
+        data = request.json
+        logs = data.get('logs', [])
+        
+        frontend_log = LOG_DIR / f"frontend_{int(time.time())}.log"
+        with open(frontend_log, 'w') as f:
+            f.write("FRONTEND CONSOLE LOGS\n")
+            f.write("=" * 70 + "\n\n")
+            for log_entry in logs:
+                f.write(f"{log_entry}\n")
+        
+        return jsonify({"success": True, "file": frontend_log.name}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==============================
+# WEBSOCKET ENDPOINT (PRIMARY REALTIME INTERFACE)
+# ==============================
+@sock.route('/api/stream')
+def websocket_stream(ws):
+    """
+    WebSocket endpoint for TRUE REAL-TIME bidirectional audio streaming.
+    
+    This is the PRIMARY endpoint for continuous speech-to-speech interaction.
+    
+    Protocol:
+    CLIENT → SERVER:
+        {"type": "start_request"}  - Start response generation (call when user clicks Start)
+        {"type": "audio_chunk", "data": "base64_pcm16", "chunk_index": 0}  - Send PCM-16 audio chunk
+        {"type": "audio.commit"}  - Signal end of audio input
+        {"type": "text_input", "text": "..."}  - Send text input for processing
+        {"type": "interrupt"}  - Stop current response generation
+    
+    SERVER → CLIENT:
+        {"type": "audio_chunk", "data": "base64_pcm16", ...}  - Response audio
+        {"type": "transcript", "text": "..."}  - Input transcription
+        {"type": "response_text", "text": "..."}  - Response text
+        {"type": "tool_call"}  - Tool execution
+        {"type": "tool_result"}  - Tool result
+        {"type": "response_complete"}  - Response finished
+        {"type": "error"}  - Error occurred
+    
+    Key Features:
+    - Incremental audio chunk handling (no waiting for full audio)
+    - Bidirectional streaming (simultaneous audio in/out)
+    - Persistent connection across multiple turn exchanges
+    - Automatic speech-to-speech with audio output
+    - Tool execution in background without blocking
+    """
+    try:
+        # Create event loop for async operations
+        stream_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(stream_loop)
+        
+        # Initialize state variables for tracking turns and audio
+        response_in_progress = False
+        current_turn_id = 0
+        turn_append_count = 0
+        turn_append_total_chars = 0
+        turn_start_time = None
+        current_response_id = None
+        
+        async def handle_websocket_stream():
+            """Main WebSocket stream handler"""
+            nonlocal response_in_progress, current_turn_id, turn_append_count, turn_append_total_chars, turn_start_time, current_response_id
+            
+            # === INITIALIZE ALL VARIABLES BEFORE TRY BLOCK ===
+            client = None
+            audio_chunks_queue = None
+            chunk_sender_task = None
+            audio_receiver_task = None
+            
+            try:
+                # Connect to Azure Realtime API using official SDK
+                # Extract base endpoint from ENDPOINT env var
+                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+                if not azure_endpoint:
+                    raise ValueError("AZURE_OPENAI_ENDPOINT not configured")
+                
+                # Clean endpoint: remove query parameters AND /openai/realtime path
+                # Azure SDK expects: https://resource-name.openai.azure.com/
+                base_endpoint = azure_endpoint.split("?")[0]  # Remove query params
+                base_endpoint = base_endpoint.split("/openai")[0]  # Remove /openai/realtime path
+                
+                # Ensure it ends with a trailing slash
+                if not base_endpoint.endswith("/"):
+                    base_endpoint += "/"
+                
+                deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini-realtime-preview")
+                
+                # Create client with cleaned endpoint
+                client = RealtimeClient(API_KEY, base_endpoint, deployment)
+                await client.connect()
+                
+                # Create audio queue for streaming chunks
+                audio_chunks_queue = asyncio.Queue()
+                
+                # === BACKGROUND TASK: Send queued audio chunks to Azure in parallel ===
+                async def send_chunks_to_azure():
+                    """Continuously send audio chunks from queue to Azure as they arrive"""
+                    chunk_idx = 0
+                    consecutive_timeouts = 0
+                    try:
+                        while True:
+                            try:
+                                # Non-blocking: try to get chunk with timeout
+                                # Use 5-second timeout: quick fail for text-only mode, plenty of time for audio chunks
+                                audio_data = await asyncio.wait_for(audio_chunks_queue.get(), timeout=5.0)
+                                consecutive_timeouts = 0  # Reset counter on successful chunk
+                                
+                                if audio_data == "END_OF_AUDIO":
+                                    chunk_idx = 0  # Reset chunk counter for next turn
+                                    continue  # Continue listening for next turn's chunks
+                                
+                                # IMMEDIATELY send chunk to Azure (in parallel)
+                                await client.send_audio_chunk(audio_data, chunk_idx)
+                                chunk_idx += 1
+                                
+                            except asyncio.TimeoutError:
+                                # Timeout is OK - might be text-only input mode (no audio)
+                                consecutive_timeouts += 1
+                                # After 3 consecutive timeouts (15 seconds total), likely no audio coming
+                                # but still continue in case audio starts later
+                                if consecutive_timeouts >= 3:
+                                    consecutive_timeouts = 0  # Reset and keep waiting
+                                continue  # Don't break - keep waiting for possible audio
+                    except Exception as e:
+                        pass
+                
+                # === BACKGROUND TASK: Receive control messages from WebSocket client ===
+                async def receive_client_messages():
+                    """Receive messages from WebSocket client and queue audio"""
+                    nonlocal response_in_progress, current_turn_id, turn_append_count, turn_append_total_chars, turn_start_time, current_response_id
+                    
+                    try:
+                        while True:
+                            # Receive message from browser client
+                            # NOTE: ws.receive() is synchronous in Flask-Sock
+                            # Must run in executor to avoid blocking event loop
+                            message_str = await asyncio.get_event_loop().run_in_executor(None, ws.receive)
+                            if not message_str:
+                                continue
+                            
+                            try:
+                                msg = json.loads(message_str)
+                            except json.JSONDecodeError:
+                                continue
+                            
+                            msg_type = msg.get('type')
+                            
+                            # === Handle different message types ===
+                            if msg_type == 'audio_chunk':
+                                audio_data = msg.get('data', '')
+                                chunk_idx = msg.get('chunk_index', 0)
+                                
+                                if audio_data:
+                                    # === NEW TURN DETECTION: Increment turn_id when starting fresh chunks ===
+                                    if turn_append_count == 0:
+                                        current_turn_id += 1
+                                        turn_start_time = time.time()
+                                    
+                                    # Queue chunk for sending to Azure (in parallel)
+                                    await audio_chunks_queue.put(audio_data)
+                                    turn_append_count += 1
+                                    turn_append_total_chars += len(audio_data)
+                            
+                            elif msg_type == 'audio.commit':
+                                # Browser signals end of audio input - NOW REQUEST RESPONSE
+                                
+                                # === GUARD: Prevent empty buffer commit ===
+                                if turn_append_count == 0:
+                                    turn_append_count = 0
+                                    turn_append_total_chars = 0
+                                    continue
+                                
+                                # === MULTI-TURN GUARD: Auto-cancel if response still active ===
+                                if response_in_progress:
+                                    await client.interrupt_response()
+                                    response_in_progress = False
+                                
+                                # Signal chunk sender to stop
+                                await audio_chunks_queue.put("END_OF_AUDIO")
+                                
+                                # Wait for last chunks to be sent to Azure
+                                await asyncio.sleep(0.2)
+                                
+                                # Commit the buffer
+                                # Azure will automatically generate response (no manual request needed)
+                                await client.commit_audio_buffer()
+                                response_in_progress = True
+                                
+                                # === RESET TURN COUNTERS FOR NEXT TURN ===
+                                turn_append_count = 0
+                                turn_append_total_chars = 0
+                            
+                            elif msg_type == 'interrupt':
+                                # Interrupt current response
+                                await client.interrupt_response()
+                            
+                            elif msg_type == 'start_request':
+                                # === START REQUEST HANDLER - User clicked Start button or initiated via text ===
+                                # Request response immediately to warm up connection
+                                if not response_in_progress:
+                                    current_turn_id += 1
+                                    turn_start_time = time.time()
+                                    session_metrics.log(f"🎯 Start request - initiating response generation")
+                                    
+                                    # Request response from Azure
+                                    await client.request_response(["audio", "text"])
+                                    response_in_progress = True
+                                
+                                # Always send confirmation to frontend (even if response already in progress)
+                                # This ensures frontend knows backend is ready for text input
+                                ws.send(json.dumps({
+                                    "type": "request_ready",
+                                    "message": "Response generation started, ready for input"
+                                }))
+                            
+                            elif msg_type == 'text_input':
+                                # === TEXT INPUT HANDLER ===
+                                user_text = msg.get('text', '').strip()
+                                
+                                if not user_text:
+                                    continue
+                                
+                                # IMPORTANT: Ensure response generation is active
+                                # Even if response_in_progress was reset by response.done,
+                                # we need to ensure request_response() is called for the text
+                                if not response_in_progress:
+                                    current_turn_id += 1
+                                    turn_start_time = time.time()
+                                    session_metrics.log(f"🎯 Auto-starting response for text input (response_in_progress was False)")
+                                    await client.request_response(["audio", "text"])
+                                    response_in_progress = True
+                                
+                                # Send text input to Azure SDK
+                                await client.send_text_input(user_text)
+                                session_metrics.log(f"💬 Text input received: {user_text[:50]}...")
+                                # Azure will automatically generate response for this text
+                            
+                            else:
+                                pass
+                    
+                    except Exception as e:
+                        traceback.print_exc()
+                    finally:
+                        pass
+                
+                # Start background tasks
+                chunk_sender_task = asyncio.create_task(send_chunks_to_azure())
+                audio_receiver_task = asyncio.create_task(receive_client_messages())
+                
+                # === CONCURRENCY VERIFICATION ===
+                # Don't print debug info
+                pass
+                
+                # === VERIFY TASKS ARE NOT DONE YET ===
+                await asyncio.sleep(0.01)  # Allow tasks to start
+                # Check task status
+                pass
+                
+                # === MAIN RESPONSE STREAMING LOOP ===
+                event_counter = {}
+                audio_chunk_count = 0
+                response_count = 0
+                first_audio_time = None
+                tool_output_pending = False
+                current_response_id = None  # Track current response to ignore old events
+                
+                try:
+                    loop_iteration = 0
+                    while True:
+                        loop_iteration += 1
+                        # Receive event from Azure
+                        try:
+                            msg = await asyncio.wait_for(client.recv_event(), timeout=120.0)
+                        except asyncio.TimeoutError:
+                            raise
+                        except Exception as e:
+                            traceback.print_exc()
+                            raise
+                        
+                        # === Parse event ===
+                        event_type = msg.get("type")
+                        response_id = msg.get("response_id")
+                        
+                        # === IMPORTANT: Ignore events from old responses when a new response starts ===
+                        if response_id and current_response_id and response_id != current_response_id:
+                            # This event is from an old response, skip it
+                            continue
+                        
+                        # Track current response
+                        if response_id and not current_response_id:
+                            current_response_id = response_id
+                        
+                        event_counter[event_type] = event_counter.get(event_type, 0) + 1
+                        
+                        # === Handle different event types from Azure ===
+                        
+                        # Audio response - THIS IS WHAT WE'RE WAITING FOR
+                        if event_type == "response.audio.delta":
+                            delta = msg.get("delta", "")
+                            if delta:
+                                if first_audio_time is None:
+                                    first_audio_time = time.time()
+                                
+                                audio_chunk_count += 1
+                                
+                                # Forward to client immediately (real-time streaming)
+                                ws.send(json.dumps({
+                                    "type": "audio_chunk",
+                                    "response_id": current_response_id,
+                                    "data": delta,
+                                    "chunk_id": audio_chunk_count,
+                                    "timestamp": time.time()
+                                }))
+                                
+                                if audio_chunk_count % 10 == 0:
+                                    pass
+                                elif audio_chunk_count == 1:
+                                    pass
+                        
+                        # Text response
+                        elif event_type == "response.text.delta":
+                            text = msg.get("delta", "")
+                            if text:
+                                ws.send(json.dumps({
+                                    "type": "response_text",
+                                    "text": text
+                                }))
+                                session_metrics.output_chunks += 1
+                        
+                        # Input transcription
+                        elif event_type == "input_audio_transcript.delta":
+                            transcript = msg.get("delta", "")
+                            if transcript:
+                                ws.send(json.dumps({
+                                    "type": "transcript",
+                                    "text": transcript
+                                }))
+                                session_metrics.input_chunks += 1
+                        
+                        # Tool execution - MUST BE NON-BLOCKING
+                        elif event_type == "response.function_call_arguments.done":
+                            fn = msg.get("name")
+                            args = json.loads(msg.get("arguments", "{}"))
+                            call_id = msg.get("call_id")
+                            
+                            session_metrics.tools_called.append({"name": fn, "args": args})
+                            
+                            # Mark that a tool was called
+                            tool_output_pending = True
+                            
+                            # Send tool call notification to client
+                            ws.send(json.dumps({
+                                "type": "tool_call",
+                                "name": fn,
+                                "args": args,
+                                "call_id": call_id
+                            }))
+                            
+                            # === Execute tool in background WITHOUT blocking receive loop ===
+                            async def execute_tool_background(fn, args, call_id):
+                                """Execute tool in background - doesn't block receive loop"""
+                                try:
+                                    result = await client._execute_tool_async_impl(fn, args)
+                                    
+                                    # Send result back to Azure
+                                    await client._send_message({
+                                        "type": "conversation.item.create",
+                                        "item": {
+                                            "type": "function_call_output",
+                                            "call_id": call_id,
+                                            "output": json.dumps(result)
+                                        }
+                                    })
+                                    
+                                    # Notify client
+                                    ws.send(json.dumps({
+                                        "type": "tool_result",
+                                        "call_id": call_id,
+                                        "result": result
+                                    }))
+                                    session_metrics.tool_results.append({"name": fn, "result": result})
+                                    
+                                except Exception as e:
+                                    traceback.print_exc()
+                                    ws.send(json.dumps({
+                                        "type": "tool_error",
+                                        "call_id": call_id,
+                                        "error": str(e)
+                                    }))
+                            
+                            # Start background task WITHOUT awaiting
+                            asyncio.create_task(execute_tool_background(fn, args, call_id))
+                        
+                        # Response complete
+                        elif event_type == "response.done":
+                            response_in_progress = False  # === Mark response as complete ===
+                            current_response_id = None  # Reset response tracking
+                            response_count += 1
+                            elapsed_ms = (time.time() - turn_start_time) * 1000 if turn_start_time else 0
+                            
+                            # If tool was called, request new response for audio generation
+                            if tool_output_pending:
+                                tool_output_pending = False
+                                await client.request_response(["audio", "text"])
+                                continue  # Continue waiting for next Azure event (response audio)
+                            
+                            # Reset counters for next cycle
+                            audio_chunk_count = 0
+                            event_counter = {}
+                            turn_append_count = 0
+                            turn_append_total_chars = 0
+                            
+                            # Client will send audio chunks when ready for next exchange
+                            pass
+                        
+                        # Error - CRITICAL to debug
+                        elif event_type == "error":
+                            error_data = msg.get("error", {})
+                            error_msg = error_data.get("message") if isinstance(error_data, dict) else str(error_data)
+                            
+                            # === DIAGNOSTIC: Log error in context of turn ===
+                            ws.send(json.dumps({
+                                "type": "error",
+                                "message": error_msg
+                            }))
+                        
+                        # Other events
+                        else:
+                            pass
+                
+                except asyncio.TimeoutError:
+                    ws.send(json.dumps({
+                        "type": "error",
+                        "message": "Response timeout"
+                    }))
+                
+            except Exception as e:
+                traceback.print_exc()
+                try:
+                    ws.send(json.dumps({
+                        "type": "error",
+                        "message": str(e)
+                    }))
+                except:
+                    pass
+            
+            finally:
+                # Cleanup all background tasks
+                if chunk_sender_task:
+                    chunk_sender_task.cancel()
+                    try:
+                        await chunk_sender_task
+                    except:
+                        pass
+                
+                if audio_receiver_task:
+                    audio_receiver_task.cancel()
+                    try:
+                        await audio_receiver_task
+                    except:
+                        pass
+                
+                if client:
+                    await client.close()
+                
+                session_metrics.print_summary()
+        
+        # Run the async handler
+        stream_loop.run_until_complete(handle_websocket_stream())
+        
+    except Exception as e:
+        pass
+    
+    finally:
+        try:
+            stream_loop.close()
+        except:
+            pass
+
+
+
+# ==============================
+# ENTRY POINT
+# ==============================
+if __name__ == "__main__":
+    if not API_KEY or not AZURE_ENDPOINT:
+        print("❌ Error: Missing Azure environment variables")
+        print("   Please configure .env file with:")
+        print("   - AZURE_OPENAI_API_KEY")
+        print("   - AZURE_OPENAI_ENDPOINT")
+        print("   - AZURE_OPENAI_DEPLOYMENT")
+        exit(1)
+    
+    print("="*70)
+    print("🎙️  REAL-TIME SPEECH-TO-SPEECH SERVER")
+    print("="*70)
+    print(f"\n✓ API configured")
+    print(f"✓ Azure SDK realtime connection") 
+    print(f"✓ PCM-16 @ 24000 Hz")
+    print(f"✓ Persistent WebSocket connections")
+    print(f"✓ Tool execution support")
+    print(f"✓ Full-duplex audio streaming")
+    print(f"\n📡 Endpoints:")
+    print(f"   🔴 WebSocket: ws://127.0.0.1:5000/api/stream (PRIMARY - LIVE VOICE)")
+    print(f"   🟢 Health: http://127.0.0.1:5000/api/health")
+    print(f"   🌐 UI: http://127.0.0.1:5000")
+    print(f"\n🚀 Starting server on http://127.0.0.1:5000")
+    print("="*70 + "\n")
+    
+    app.run(debug=True, host='127.0.0.1', port=5000, threaded=True)
+
